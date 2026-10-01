@@ -1,0 +1,153 @@
+name: Process Parts with MoGe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'inputs/**'
+      - 'scripts/process.py'
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # ── CACHES ──
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: pip-moge-parts-${{ runner.os }}-v1
+        restore-keys: pip-moge-parts-${{ runner.os }}-
+
+    - name: Cache MoGe repo
+      id: cache-moge
+      uses: actions/cache@v4
+      with:
+        path: MoGe
+        key: moge-repo-${{ runner.os }}-v1
+        restore-keys: moge-repo-${{ runner.os }}-
+
+    - name: Cache MoGe checkpoint
+      id: cache-ckpt
+      uses: actions/cache@v4
+      with:
+        path: MoGe/checkpoints/moge-2-vitl-normal
+        key: moge-ckpt-vitl-normal-${{ runner.os }}-v1
+        restore-keys: moge-ckpt-vitl-normal-${{ runner.os }}-
+
+    # ── SYSTEM ──
+    - name: Install system deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential git wget \
+          libgl1 libglib2.0-0
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    - name: Install Python packages
+      run: |
+        pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+
+    # ── MOGE (with fallback) ──
+    - name: Clone MoGe (if cache miss)
+      if: steps.cache-moge.outputs.cache-hit != 'true'
+      run: |
+        echo "[INFO] Cache miss — cloning MoGe"
+        git clone https://github.com/microsoft/MoGe.git
+
+    - name: Verify MoGe repo
+      run: |
+        if [ ! -d "MoGe" ]; then
+          echo "[ERROR] MoGe missing. Re-cloning."
+          git clone https://github.com/microsoft/MoGe.git
+        fi
+
+    - name: Install MoGe
+      run: |
+        cd MoGe
+        pip install -e .
+
+    - name: Verify checkpoint
+      id: verify-ckpt
+      run: |
+        F="MoGe/checkpoints/moge-2-vitl-normal/model.pt"
+        if [ -f "$F" ]; then
+          S=$(stat -c%s "$F")
+          echo "Checkpoint found ($S bytes)"
+          if [ "$S" -lt 1000000000 ]; then
+            echo "Too small — forcing re-download"
+            rm -rf MoGe/checkpoints/moge-2-vitl-normal
+            echo "valid=false" >> $GITHUB_OUTPUT
+          else
+            echo "valid=true" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "valid=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Download MoGe-2 model (fallback)
+      if: steps.verify-ckpt.outputs.valid != 'true'
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: |
+        python -c "
+        from huggingface_hub import snapshot_download
+        snapshot_download(
+            repo_id='Ruicheng/moge-2-vitl-normal',
+            local_dir='MoGe/checkpoints/moge-2-vitl-normal',
+            token='${{ secrets.HF_TOKEN }}'
+        )
+        "
+
+    # ── RUN ──
+    - name: Process parts
+      run: python scripts/process.py 2>&1 | tee /tmp/parts.log
+
+    - name: Show log tail
+      if: always()
+      run: tail -80 /tmp/parts.log || true
+
+    - name: List outputs
+      if: always()
+      run: |
+        echo "=== outputs/ ==="
+        find outputs -maxdepth 2 -type d | sort
+        echo ""
+        du -sh outputs/ 2>/dev/null || echo "empty"
+
+    - name: Copy index to docs
+      if: always()
+      run: |
+        mkdir -p docs
+        if [ -f outputs/library_index.json ]; then
+          cp outputs/library_index.json docs/library_index.json
+        fi
+
+    - name: Commit outputs
+      uses: stefanzweifel/git-auto-commit-action@v5
+      with:
+        commit_message: "chore: process parts with MoGe"
+        branch: main
+        file_pattern: "outputs/ docs/"
+
+    - name: Upload artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: parts-library-${{ github.run_number }}
+        path: outputs/
+        if-no-files-found: warn
